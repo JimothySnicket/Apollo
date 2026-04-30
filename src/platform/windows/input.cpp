@@ -1777,6 +1777,12 @@ namespace platf {
       BOOST_LOG(warning) << "Touch input requires Windows 10 1809 or later"sv;
     }
 
+    // H3: advertise mic-input support on Windows (WASAPI render path implemented in H2).
+    // Linux and macOS do NOT set this bit — H4 will add stubs but no routing yet,
+    // so advertising would mislead capable clients into sending mic audio that
+    // Apollo cannot route.
+    caps |= platform_caps::mic_input;
+
     return caps;
   }
 }  // namespace platf

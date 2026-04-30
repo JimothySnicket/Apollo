@@ -275,11 +275,14 @@ namespace platf {
   };
 
   // These values must match Limelight-internal.h's SS_FF_* constants!
+  // mic_input additionally stays in sync with SS_FF_MIC_INPUT in stream.cpp
+  // and moonlight-common-c/src/Mic.h.
   namespace platform_caps {
     typedef uint32_t caps_t;
 
     constexpr caps_t pen_touch = 0x01;  // Pen and touch events
     constexpr caps_t controller_touch = 0x02;  // Controller touch events
+    constexpr caps_t mic_input = 0x0100;  // Host can receive client microphone audio (Windows only; H3)
   };  // namespace platform_caps
 
   struct gamepad_state_t {
