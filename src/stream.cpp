@@ -15,6 +15,7 @@
 extern "C" {
   // clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
+#include <opus/opus.h>
 #include "rswrapper.h"
   // clang-format on
 }
@@ -53,6 +54,7 @@ extern "C" {
 #define IDX_SET_CLIPBOARD 16
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 17
 #define IDX_SET_ADAPTIVE_TRIGGERS 18
+#define IDX_MIC_OPUS_DATA 19
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -74,6 +76,7 @@ static const short packetTypes[] = {
   0x3001,  // Set Clipboard (Apollo protocol extension)
   0x3002,  // File transfer nonce request (Apollo protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x5510,  // Client-to-host microphone Opus frame (moonlight-mic extension; see docs/design/WIRE.md)
 };
 
 namespace asio = boost::asio;
@@ -238,6 +241,28 @@ namespace stream {
     AUDIO_FEC_HEADER fecHeader;
   };
 
+  // SS_MIC_OPUS_PTYPE / SS_MIC_FRAME_HEADER
+  // MUST stay in sync with moonlight-common-c/src/Mic.h
+  //
+  // Client-to-host microphone frame header. All multi-byte fields are
+  // big-endian on the wire, matching the moonlight-common-c declaration.
+  // Wire format: 8-byte header followed by opusFrameLength bytes of Opus
+  // payload (mono / 48 kHz / 20 ms frames). See docs/design/WIRE.md.
+  //
+  // SS_MIC_OPUS_PTYPE = 0x5510 (allocated from the Sunshine 0x55xx range)
+  static constexpr std::uint16_t SS_MIC_OPUS_PTYPE = 0x5510;
+
+  struct mic_frame_header_t {
+    boost::endian::big_uint16_at sequenceNumber;   // BE16; monotonic, wraps at 65535
+    boost::endian::big_uint16_at opusFrameLength;  // BE16; byte length of the Opus payload following this struct
+    boost::endian::big_uint32_at timestampSamples; // BE32; 48 kHz sample count since first frame this session
+  };
+
+  static_assert(
+    sizeof(mic_frame_header_t) == 8,
+    "mic_frame_header_t must be 8 bytes"
+  );
+
 #pragma pack(pop)
 
   constexpr std::size_t round_to_pkcs7_padded(std::size_t size) {
@@ -247,6 +272,11 @@ namespace stream {
   constexpr std::size_t MAX_AUDIO_PACKET_SIZE = 1400;
 
   using audio_aes_t = std::array<char, round_to_pkcs7_padded(MAX_AUDIO_PACKET_SIZE)>;
+
+  // RAII wrapper around an OpusDecoder for the client-to-host microphone
+  // stream. One per streaming session; allocated in session::alloc(),
+  // released automatically when the session_t is destroyed.
+  using opus_decoder_t = util::safe_ptr<OpusDecoder, opus_decoder_destroy>;
 
   using av_session_id_t = std::variant<asio::ip::address, std::string>;  // IP address or SS-Ping-Payload from RTSP handshake
   using message_queue_t = std::shared_ptr<safe::queue_t<std::pair<udp::endpoint, std::string>>>;
@@ -410,6 +440,16 @@ namespace stream {
       platf::feedback_queue_t feedback_queue;
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;
     } control;
+
+    struct {
+      // Per-session Opus decoder for the client-to-host microphone stream
+      // (moonlight-mic extension SS_MIC_OPUS_PTYPE = 0x5510). Allocated in
+      // session::alloc(), released by the safe_ptr destructor when the session
+      // is freed. Fixed at 48 kHz / mono / 20 ms frames matching the wire spec.
+      opus_decoder_t decoder;
+      std::uint16_t lastSeq;
+      bool seenFirstFrame;
+    } mic;
 
     std::uint32_t launch_session_id;
     std::string device_name;
@@ -1050,6 +1090,74 @@ namespace stream {
         BOOST_LOG(debug) << "Permission File Upload deined for [" << session->device_name << "]";
         return;
       }
+    });
+
+    server->map(packetTypes[IDX_MIC_OPUS_DATA], [](session_t *session, const std::string_view &payload) {
+      // moonlight-mic extension: client-to-host microphone Opus frame.
+      // Wire format: 8-byte big-endian SS_MIC_FRAME_HEADER followed by
+      // opusFrameLength bytes of Opus payload (mono / 48 kHz / 20 ms).
+      // See docs/design/WIRE.md and moonlight-common-c/src/Mic.h.
+      constexpr std::size_t MIC_PACKET_MTU = 1400;  // matches MAX_PACKET_SIZE in moonlight-common-c
+      constexpr int MIC_SAMPLE_RATE = 48000;
+      constexpr int MIC_FRAME_DURATION_MS = 20;
+      constexpr int MIC_SAMPLES_PER_FRAME = MIC_SAMPLE_RATE * MIC_FRAME_DURATION_MS / 1000;  // 960
+
+      // --- Validation ---
+
+      if (payload.size() < sizeof(mic_frame_header_t)) {
+        BOOST_LOG(warning) << "Mic packet runt: "sv << payload.size()
+                           << " bytes (need >= "sv << sizeof(mic_frame_header_t) << ')';
+        return;
+      }
+
+      auto header = reinterpret_cast<const mic_frame_header_t *>(payload.data());
+      const uint16_t seq = header->sequenceNumber;
+      const uint16_t opusLen = header->opusFrameLength;
+      const uint32_t tsSamples = header->timestampSamples;
+
+      if (opusLen < 1 || opusLen > MIC_PACKET_MTU - sizeof(mic_frame_header_t)) {
+        BOOST_LOG(warning) << "Mic packet bad opusFrameLength: "sv << opusLen;
+        return;
+      }
+      if (sizeof(mic_frame_header_t) + opusLen != payload.size()) {
+        BOOST_LOG(warning) << "Mic packet length mismatch: header opusFrameLength="sv << opusLen
+                           << " payload.size()="sv << payload.size();
+        return;
+      }
+
+      if (!session->mic.decoder) {
+        BOOST_LOG(warning) << "Mic packet dropped: decoder unavailable"sv;
+        return;
+      }
+
+      // --- Decode ---
+
+      const auto *opusBytes = reinterpret_cast<const unsigned char *>(payload.data()) + sizeof(mic_frame_header_t);
+      opus_int16 pcmBuffer[MIC_SAMPLES_PER_FRAME];
+
+      // Feed opus_decode the wire-spec frame size (not the packet header value
+      // verbatim). WIRE.md mandates 960 samples per frame at 48 kHz.
+      const int decodedSamples = opus_decode(session->mic.decoder.get(),
+                                             opusBytes,
+                                             static_cast<opus_int32>(opusLen),
+                                             pcmBuffer,
+                                             MIC_SAMPLES_PER_FRAME,
+                                             0);
+      if (decodedSamples < 0) {
+        BOOST_LOG(warning) << "Mic decode failed: "sv << opus_strerror(decodedSamples);
+        return;
+      }
+
+      BOOST_LOG(debug) << "Mic frame decoded: seq="sv << seq
+                       << " opusLen="sv << opusLen
+                       << " pcmSamples="sv << decodedSamples
+                       << " ts="sv << tsSamples;
+
+      session->mic.lastSeq = seq;
+      session->mic.seenFirstFrame = true;
+
+      // H1: decode-and-discard. H2 will route pcmBuffer to WASAPI.
+      (void) pcmBuffer;
     });
 
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
@@ -2217,6 +2325,22 @@ namespace stream {
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
+
+      // Allocate the per-session Opus decoder for the client-to-host mic stream.
+      // Fixed at 48 kHz / mono per the wire spec (docs/design/WIRE.md).
+      // If creation fails, log and leave the decoder null — the dispatch handler
+      // will tolerate a null decoder by dropping mic packets with a warning.
+      {
+        int opus_err = 0;
+        OpusDecoder *raw_decoder = opus_decoder_create(48000, 1, &opus_err);
+        if (raw_decoder == nullptr || opus_err != OPUS_OK) {
+          BOOST_LOG(error) << "Mic decoder: opus_decoder_create failed: "sv << opus_strerror(opus_err);
+        } else {
+          session->mic.decoder.reset(raw_decoder);
+        }
+      }
+      session->mic.lastSeq = 0;
+      session->mic.seenFirstFrame = false;
 
       session->mail = std::move(mail);
 
