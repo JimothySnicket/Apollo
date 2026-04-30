@@ -12,6 +12,28 @@
 #include <boost/endian/arithmetic.hpp>
 #include <openssl/err.h>
 
+#ifdef _WIN32
+  // WASAPI for the host-side mic render path (H2). We deliberately do NOT
+  // define INITGUID here — the GUID symbols (IID_IMMDeviceEnumerator,
+  // CLSID_MMDeviceEnumerator, IID_IAudioClient, IID_IAudioRenderClient,
+  // PKEY_*) are emitted as concrete symbols by
+  // src/platform/windows/audio.cpp (which does define INITGUID) and we
+  // link to them. Defining INITGUID here would produce duplicate-symbol
+  // link errors.
+  //
+  // winsock2.h MUST be included before any Windows header that pulls in
+  // windows.h, otherwise the inclusion order produces duplicate-definition
+  // warnings. mmdeviceapi.h and friends transitively include windows.h.
+  #include <winsock2.h>
+  #include <Audioclient.h>
+  #include <mmdeviceapi.h>
+  #include <propkey.h>
+  #include <propsys.h>
+  #include <cstring>
+  #include <cwchar>
+  #include <cwctype>
+#endif
+
 extern "C" {
   // clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
@@ -278,6 +300,341 @@ namespace stream {
   // released automatically when the session_t is destroyed.
   using opus_decoder_t = util::safe_ptr<OpusDecoder, opus_decoder_destroy>;
 
+#ifdef _WIN32
+  // H2: WASAPI plumbing to push decoded mic PCM into the
+  // "Microphone (Steam Streaming Microphone)" virtual render endpoint
+  // installed by Apollo's Steam audio driver bundle.  Kept in stream.cpp
+  // so it doesn't widen the surface of the host-to-client audio path.
+  // COM Release helper — mirrors the pattern used in audio.cpp.
+  template<class T>
+  static void mic_com_release(T *p) {
+    p->Release();
+  }
+
+  using imm_device_enum_t = util::safe_ptr<IMMDeviceEnumerator, mic_com_release<IMMDeviceEnumerator>>;
+  using imm_device_t = util::safe_ptr<IMMDevice, mic_com_release<IMMDevice>>;
+  using imm_collection_t = util::safe_ptr<IMMDeviceCollection, mic_com_release<IMMDeviceCollection>>;
+  using imm_property_store_t = util::safe_ptr<IPropertyStore, mic_com_release<IPropertyStore>>;
+  using imm_audio_client_t = util::safe_ptr<IAudioClient, mic_com_release<IAudioClient>>;
+  using imm_render_client_t = util::safe_ptr<IAudioRenderClient, mic_com_release<IAudioRenderClient>>;
+
+  // The PCM sample-format flavour we handle on the render endpoint.
+  enum class mic_sample_kind {
+    unsupported,  // anything without an explicit conversion path
+    int16,        // 16-bit signed little-endian PCM
+    float32,      // 32-bit IEEE-754 little-endian float
+  };
+
+  // RAII wrapper for the per-session WASAPI render endpoint.
+  // Null-tolerant: missing Steam driver = nullptr endpoint = H1 decode-and-discard.
+  // Destructor calls Stop() before the COM safe_ptr Release() calls fire.
+  struct mic_endpoint_t {
+    imm_audio_client_t audio_client;
+    imm_render_client_t render_client;
+    UINT32 buffer_frame_count = 0;
+
+    // Format negotiated from GetMixFormat(); stored after Initialize() succeeds.
+    DWORD sample_rate = 0;
+    WORD channels = 0;
+    WORD bits_per_sample = 0;
+    mic_sample_kind sample_kind = mic_sample_kind::unsupported;
+
+    ~mic_endpoint_t() {
+      if (audio_client) {
+        audio_client->Stop();
+      }
+      // safe_ptr destructors call Release() on audio_client and render_client.
+    }
+  };
+
+  // PKEY_Device_FriendlyName inline — avoids a second INITGUID definition
+  // (which would clash with the one in src/platform/windows/audio.cpp).
+  // fmtid + pid match the DEFINE_PROPERTYKEY in audio.cpp exactly.
+  static const PROPERTYKEY mic_pkey_device_friendly_name = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
+    14
+  };
+
+  // KSDATAFORMAT_SUBTYPE_PCM and KSDATAFORMAT_SUBTYPE_IEEE_FLOAT inline,
+  // same reason as above.
+  static const GUID mic_ksdataformat_subtype_pcm = {
+    0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
+  };
+  static const GUID mic_ksdataformat_subtype_ieee_float = {
+    0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
+  };
+
+  // Classify a WAVEFORMATEX (possibly WAVEFORMATEXTENSIBLE) into one of our
+  // conversion paths.  Most consumer endpoints return WAVE_FORMAT_EXTENSIBLE
+  // wrapping IEEE_FLOAT 32-bit, so that branch is the hot path in practice.
+  static mic_sample_kind detect_mic_sample_kind(const WAVEFORMATEX *wfx) {
+    if (!wfx) {
+      return mic_sample_kind::unsupported;
+    }
+    if (wfx->wFormatTag == WAVE_FORMAT_PCM && wfx->wBitsPerSample == 16) {
+      return mic_sample_kind::int16;
+    }
+    if (wfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT && wfx->wBitsPerSample == 32) {
+      return mic_sample_kind::float32;
+    }
+    if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+        wfx->cbSize >= (sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))) {
+      auto wfxe = reinterpret_cast<const WAVEFORMATEXTENSIBLE *>(wfx);
+      if (IsEqualGUID(wfxe->SubFormat, mic_ksdataformat_subtype_ieee_float) &&
+          wfx->wBitsPerSample == 32) {
+        return mic_sample_kind::float32;
+      }
+      if (IsEqualGUID(wfxe->SubFormat, mic_ksdataformat_subtype_pcm) &&
+          wfx->wBitsPerSample == 16) {
+        return mic_sample_kind::int16;
+      }
+    }
+    return mic_sample_kind::unsupported;
+  }
+
+  // Case-insensitive wide-string substring match for friendly name lookup.
+  static bool wstr_contains_icase(const wchar_t *haystack, const wchar_t *needle) {
+    if (!haystack || !needle) {
+      return false;
+    }
+    const std::size_t hlen = std::wcslen(haystack);
+    const std::size_t nlen = std::wcslen(needle);
+    if (nlen == 0 || hlen < nlen) {
+      return false;
+    }
+    for (std::size_t i = 0; i + nlen <= hlen; ++i) {
+      bool match = true;
+      for (std::size_t j = 0; j < nlen; ++j) {
+        if (std::towlower(haystack[i + j]) != std::towlower(needle[j])) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Enumerate render endpoints and open the Steam Streaming Microphone one.
+  // Returns nullptr on any failure and logs a meaningful diagnostic; the
+  // caller must tolerate null and continue without routing audio.
+  //
+  // Format is negotiated via IAudioClient::GetMixFormat() — the only format
+  // guaranteed to succeed in AUDCLNT_SHAREMODE_SHARED without hitting
+  // AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008). See landmines.md entry
+  // "WASAPI shared mode — WAVE_FORMAT_EXTENSIBLE mismatch".
+  static std::unique_ptr<mic_endpoint_t> open_steam_mic_endpoint() {
+    // 200 ms buffer in REFERENCE_TIME units (100 ns each). 100 ms caused
+    // chronic underruns in POC live testing — buffer drained to zero between
+    // mic packets every ~20 ms, producing helicopter-chop distortion.
+    constexpr REFERENCE_TIME MIC_BUFFER_DURATION = 2000000;
+
+    // 1. CoCreate the device enumerator.
+    imm_device_enum_t device_enum;
+    {
+      IMMDeviceEnumerator *raw = nullptr;
+      HRESULT hr = CoCreateInstance(
+        CLSID_MMDeviceEnumerator,
+        nullptr,
+        CLSCTX_ALL,
+        IID_IMMDeviceEnumerator,
+        reinterpret_cast<void **>(&raw)
+      );
+      if (FAILED(hr) || !raw) {
+        BOOST_LOG(warning) << "Mic endpoint: CoCreateInstance(MMDeviceEnumerator) failed [0x"sv
+                           << util::hex(hr).to_string_view() << "]; mic packets will be decoded and discarded"sv;
+        return nullptr;
+      }
+      device_enum.reset(raw);
+    }
+
+    // 2. Enumerate active render endpoints.
+    imm_collection_t collection;
+    {
+      IMMDeviceCollection *raw = nullptr;
+      HRESULT hr = device_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &raw);
+      if (FAILED(hr) || !raw) {
+        BOOST_LOG(warning) << "Mic endpoint: EnumAudioEndpoints failed [0x"sv
+                           << util::hex(hr).to_string_view() << "]; mic packets will be decoded and discarded"sv;
+        return nullptr;
+      }
+      collection.reset(raw);
+    }
+
+    UINT count = 0;
+    if (FAILED(collection->GetCount(&count))) {
+      BOOST_LOG(warning) << "Mic endpoint: IMMDeviceCollection::GetCount failed; mic packets will be decoded and discarded"sv;
+      return nullptr;
+    }
+
+    // 3. Find the device whose friendly name contains "Steam Streaming Microphone".
+    //    Substring + case-insensitive match so both "Microphone (Steam Streaming Microphone)"
+    //    (Win10/Win11 display name) and bare "Steam Streaming Microphone" resolve.
+    imm_device_t device;
+    for (UINT i = 0; i < count; ++i) {
+      IMMDevice *raw_device = nullptr;
+      if (FAILED(collection->Item(i, &raw_device)) || !raw_device) {
+        continue;
+      }
+      imm_device_t candidate;
+      candidate.reset(raw_device);
+
+      IPropertyStore *raw_props = nullptr;
+      if (FAILED(candidate->OpenPropertyStore(STGM_READ, &raw_props)) || !raw_props) {
+        continue;
+      }
+      imm_property_store_t props;
+      props.reset(raw_props);
+
+      PROPVARIANT pv;
+      PropVariantInit(&pv);
+      const HRESULT hr_get = props->GetValue(mic_pkey_device_friendly_name, &pv);
+      if (SUCCEEDED(hr_get) && pv.vt == VT_LPWSTR && pv.pwszVal) {
+        if (wstr_contains_icase(pv.pwszVal, L"Steam Streaming Microphone")) {
+          BOOST_LOG(debug) << "Mic endpoint: matched render endpoint at index "sv << i;
+          device = std::move(candidate);
+          PropVariantClear(&pv);
+          break;
+        }
+      }
+      PropVariantClear(&pv);
+    }
+
+    if (!device) {
+      BOOST_LOG(warning) << "Steam Streaming Microphone endpoint not found among "sv
+                         << count << " active render devices; mic packets will be decoded and discarded"sv;
+      return nullptr;
+    }
+
+    // 4. Activate the IAudioClient.
+    imm_audio_client_t audio_client;
+    {
+      IAudioClient *raw = nullptr;
+      HRESULT hr = device->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&raw));
+      if (FAILED(hr) || !raw) {
+        BOOST_LOG(warning) << "Mic endpoint: IMMDevice::Activate(IAudioClient) failed [0x"sv
+                           << util::hex(hr).to_string_view() << ']';
+        return nullptr;
+      }
+      audio_client.reset(raw);
+    }
+
+    // 5. Negotiate format via GetMixFormat. In AUDCLNT_SHAREMODE_SHARED
+    //    this is the only format guaranteed not to fail with
+    //    AUDCLNT_E_UNSUPPORTED_FORMAT. The returned pointer is WASAPI-owned
+    //    and must be CoTaskMemFree'd when done.
+    WAVEFORMATEX *pMixFormat = nullptr;
+    {
+      HRESULT hr = audio_client->GetMixFormat(&pMixFormat);
+      if (FAILED(hr) || !pMixFormat) {
+        BOOST_LOG(warning) << "Mic endpoint: IAudioClient::GetMixFormat failed [0x"sv
+                           << util::hex(hr).to_string_view() << ']';
+        return nullptr;
+      }
+    }
+
+    const mic_sample_kind kind = detect_mic_sample_kind(pMixFormat);
+    const char *kind_name = (kind == mic_sample_kind::int16)   ? "s16" :
+                            (kind == mic_sample_kind::float32) ? "f32" :
+                                                                 "unsupported";
+    BOOST_LOG(debug) << "Mic endpoint: mix format "sv
+                     << pMixFormat->nSamplesPerSec << " Hz, "sv
+                     << pMixFormat->nChannels << " ch, "sv
+                     << pMixFormat->wBitsPerSample << " bits, tag=0x"sv
+                     << util::hex(pMixFormat->wFormatTag).to_string_view()
+                     << " ("sv << kind_name << ')';
+
+    // 6. Initialize with the negotiated format + AUTOCONVERTPCM so WASAPI
+    //    handles any remaining SRC if needed.
+    {
+      HRESULT hr = audio_client->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRCDEFAULTQUALITY,
+        MIC_BUFFER_DURATION,
+        0,
+        pMixFormat,
+        nullptr
+      );
+      if (FAILED(hr)) {
+        BOOST_LOG(warning) << "Mic endpoint: IAudioClient::Initialize failed [0x"sv
+                           << util::hex(hr).to_string_view() << ']';
+        CoTaskMemFree(pMixFormat);
+        return nullptr;
+      }
+    }
+
+    // Snapshot negotiated format before freeing the WASAPI buffer.
+    const DWORD negotiated_sample_rate = pMixFormat->nSamplesPerSec;
+    const WORD negotiated_channels = pMixFormat->nChannels;
+    const WORD negotiated_bits = pMixFormat->wBitsPerSample;
+    CoTaskMemFree(pMixFormat);
+    pMixFormat = nullptr;
+
+    // 7. Read back the allocated buffer size.
+    UINT32 frame_count = 0;
+    if (FAILED(audio_client->GetBufferSize(&frame_count))) {
+      BOOST_LOG(warning) << "Mic endpoint: IAudioClient::GetBufferSize failed"sv;
+      return nullptr;
+    }
+
+    // 8. Get the render client.
+    imm_render_client_t render_client;
+    {
+      IAudioRenderClient *raw = nullptr;
+      HRESULT hr = audio_client->GetService(IID_IAudioRenderClient, reinterpret_cast<void **>(&raw));
+      if (FAILED(hr) || !raw) {
+        BOOST_LOG(warning) << "Mic endpoint: IAudioClient::GetService(IAudioRenderClient) failed [0x"sv
+                           << util::hex(hr).to_string_view() << ']';
+        return nullptr;
+      }
+      render_client.reset(raw);
+    }
+
+    // 9. Prime the render buffer with silence before Start(). Without a
+    //    cushion the buffer drains to zero before the first mic packet
+    //    arrives (~20 ms later with jitter), producing helicopter-chop
+    //    distortion. Half the buffer gives enough cushion without a
+    //    noticeable latency hit (T11/T12 fix from POC).
+    {
+      const UINT32 prime_frames = frame_count / 2;
+      BYTE *silence_buf = nullptr;
+      HRESULT hr_prime = render_client->GetBuffer(prime_frames, &silence_buf);
+      if (SUCCEEDED(hr_prime) && silence_buf) {
+        // AUDCLNT_BUFFERFLAGS_SILENT tells WASAPI to treat these frames as
+        // silence regardless of memory content — no memset needed.
+        render_client->ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT);
+        BOOST_LOG(debug) << "Mic endpoint: primed "sv << prime_frames << " frames of silence"sv;
+      } else {
+        BOOST_LOG(warning) << "Mic endpoint: priming GetBuffer failed [0x"sv
+                           << util::hex(hr_prime).to_string_view() << "] — continuing without prime"sv;
+      }
+    }
+
+    // 10. Start the stream.
+    if (FAILED(audio_client->Start())) {
+      BOOST_LOG(warning) << "Mic endpoint: IAudioClient::Start failed"sv;
+      return nullptr;
+    }
+
+    BOOST_LOG(debug) << "Mic endpoint: opened, buffer="sv << frame_count
+                     << " frames @ "sv << negotiated_sample_rate
+                     << " Hz, "sv << negotiated_channels << " ch, "sv
+                     << negotiated_bits << " bits ("sv << kind_name << ')';
+
+    auto endpoint = std::make_unique<mic_endpoint_t>();
+    endpoint->audio_client = std::move(audio_client);
+    endpoint->render_client = std::move(render_client);
+    endpoint->buffer_frame_count = frame_count;
+    endpoint->sample_rate = negotiated_sample_rate;
+    endpoint->channels = negotiated_channels;
+    endpoint->bits_per_sample = negotiated_bits;
+    endpoint->sample_kind = kind;
+    return endpoint;
+  }
+#endif  // _WIN32
+
   using av_session_id_t = std::variant<asio::ip::address, std::string>;  // IP address or SS-Ping-Payload from RTSP handshake
   using message_queue_t = std::shared_ptr<safe::queue_t<std::pair<udp::endpoint, std::string>>>;
   using message_queue_queue_t = std::shared_ptr<safe::queue_t<std::tuple<socket_e, av_session_id_t, message_queue_t>>>;
@@ -449,6 +806,15 @@ namespace stream {
       opus_decoder_t decoder;
       std::uint16_t lastSeq;
       bool seenFirstFrame;
+#ifdef _WIN32
+      // H2: WASAPI render endpoint for the Steam Streaming Microphone.
+      // Allocated lazily on the first 0x5510 packet arrival (endpoint_init_attempted
+      // ensures we only try once per session). Null if endpoint discovery or
+      // initialization failed — the dispatch handler falls back to H1
+      // decode-and-discard with no crash.
+      std::unique_ptr<mic_endpoint_t> endpoint;
+      bool endpoint_init_attempted = false;
+#endif
     } mic;
 
     std::uint32_t launch_session_id;
@@ -1156,8 +1522,106 @@ namespace stream {
       session->mic.lastSeq = seq;
       session->mic.seenFirstFrame = true;
 
-      // H1: decode-and-discard. H2 will route pcmBuffer to WASAPI.
+#ifdef _WIN32
+      // H2: lazy endpoint init on first 0x5510 arrival. Attempt only once
+      // per session via endpoint_init_attempted guard — avoids repeated COM
+      // enumeration on every frame when Steam drivers are absent.
+      if (!session->mic.endpoint_init_attempted) {
+        session->mic.endpoint_init_attempted = true;
+        session->mic.endpoint = open_steam_mic_endpoint();
+        // open_steam_mic_endpoint() already logged a warning if it returned null.
+      }
+
+      // H2: push decoded PCM into the Steam Streaming Microphone render
+      // endpoint. Failures here are non-fatal — log and continue so a
+      // transient WASAPI hiccup doesn't tear down the streaming session.
+      // If endpoint is null (drivers absent, init failed), this is a no-op;
+      // pcmBuffer is silently discarded (H1 decode-and-discard fallback).
+      if (session->mic.endpoint && decodedSamples > 0) {
+        auto &ep = *session->mic.endpoint;
+
+        // Sample-rate mismatch: skip rather than pitch-shift. WIRE.md section 3
+        // fixes the wire at 48 kHz; Steam Streaming Microphone is expected 48 kHz.
+        if (ep.sample_rate != 48000) {
+          BOOST_LOG(warning) << "Mic render: device sample rate "sv << ep.sample_rate
+                             << " Hz != wire 48000 Hz, skipping frame (no resampler)"sv;
+        } else if (ep.sample_kind == mic_sample_kind::unsupported) {
+          BOOST_LOG(warning) << "Mic render: device format unsupported (channels="sv
+                             << ep.channels << ", bits="sv << ep.bits_per_sample
+                             << "), skipping frame"sv;
+        } else if (ep.channels < 1 || ep.channels > 2) {
+          BOOST_LOG(warning) << "Mic render: device channel count "sv << ep.channels
+                             << " not supported (need 1 or 2), skipping frame"sv;
+        } else {
+          // Backpressure check: GetCurrentPadding gives frames already queued.
+          // Drop the frame at debug level rather than calling GetBuffer when
+          // there isn't room — avoids a redundant AUDCLNT_E_BUFFER_TOO_LARGE.
+          UINT32 padding = 0;
+          HRESULT hr_pad = ep.audio_client->GetCurrentPadding(&padding);
+          bool space_ok = false;
+          if (FAILED(hr_pad)) {
+            BOOST_LOG(warning) << "Mic render: GetCurrentPadding failed [0x"sv
+                               << util::hex(hr_pad).to_string_view() << "], dropping frame"sv;
+          } else {
+            const UINT32 available = (ep.buffer_frame_count > padding)
+                                       ? (ep.buffer_frame_count - padding)
+                                       : 0;
+            if (available < static_cast<UINT32>(decodedSamples)) {
+              BOOST_LOG(debug) << "Mic render: dropping frame (buffer full, padding="sv
+                               << padding << ", need "sv << decodedSamples << " frames)"sv;
+            } else {
+              space_ok = true;
+            }
+          }
+
+          if (space_ok) {
+            BYTE *render_buffer = nullptr;
+            HRESULT hr = ep.render_client->GetBuffer(static_cast<UINT32>(decodedSamples), &render_buffer);
+            if (SUCCEEDED(hr) && render_buffer) {
+              // Convert mono s16 (wire format) → negotiated endpoint format.
+              if (ep.channels == 1 && ep.sample_kind == mic_sample_kind::int16) {
+                // mono s16 → mono s16: direct copy.
+                std::memcpy(render_buffer, pcmBuffer,
+                            static_cast<std::size_t>(decodedSamples) * sizeof(opus_int16));
+              } else if (ep.channels == 2 && ep.sample_kind == mic_sample_kind::int16) {
+                // mono s16 → stereo s16: duplicate L=R.
+                auto *dst = reinterpret_cast<int16_t *>(render_buffer);
+                for (int i = 0; i < decodedSamples; ++i) {
+                  dst[2 * i + 0] = pcmBuffer[i];
+                  dst[2 * i + 1] = pcmBuffer[i];
+                }
+              } else if (ep.channels == 1 && ep.sample_kind == mic_sample_kind::float32) {
+                // mono s16 → mono f32: scale by 1/32768.
+                auto *dst = reinterpret_cast<float *>(render_buffer);
+                for (int i = 0; i < decodedSamples; ++i) {
+                  dst[i] = static_cast<float>(pcmBuffer[i]) / 32768.0f;
+                }
+              } else {
+                // stereo f32 (the common case on consumer Windows): L=R duplicate.
+                auto *dst = reinterpret_cast<float *>(render_buffer);
+                for (int i = 0; i < decodedSamples; ++i) {
+                  const float sample = static_cast<float>(pcmBuffer[i]) / 32768.0f;
+                  dst[2 * i + 0] = sample;
+                  dst[2 * i + 1] = sample;
+                }
+              }
+              ep.render_client->ReleaseBuffer(static_cast<UINT32>(decodedSamples), 0);
+            } else if (hr == AUDCLNT_E_BUFFER_TOO_LARGE) {
+              // Race between GetCurrentPadding and GetBuffer — consumer drained
+              // between the two calls. Drop at debug; the padding guard above
+              // should make this rare.
+              BOOST_LOG(debug) << "Mic render: GetBuffer AUDCLNT_E_BUFFER_TOO_LARGE, dropping frame"sv;
+            } else if (FAILED(hr)) {
+              BOOST_LOG(warning) << "Mic render: GetBuffer failed [0x"sv
+                                 << util::hex(hr).to_string_view() << ']';
+            }
+          }
+        }
+      }
+#else
+      // Non-Windows: decode-and-discard (H1 fallback). H4 will add stubs.
       (void) pcmBuffer;
+#endif
     });
 
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
