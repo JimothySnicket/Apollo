@@ -274,6 +274,25 @@ namespace stream {
   // SS_MIC_OPUS_PTYPE = 0x5510 (allocated from the Sunshine 0x55xx range)
   static constexpr std::uint16_t SS_MIC_OPUS_PTYPE = 0x5510;
 
+  // H3: capability-negotiation constants.
+  // MUST stay in sync with moonlight-common-c/src/Mic.h
+  //
+  // SS_FF_MIC_INPUT (host advertises in x-ss-general.featureFlags): 0x0100
+  //   Set by the host to tell the client "I can receive mic audio."
+  //   Corresponds to platform_caps::mic_input in src/platform/common.h.
+  //   On Windows, platf::get_capabilities() returns this bit.
+  //   On Linux/macOS, it is NOT returned — H4 stubs exist but no routing yet.
+  //
+  // ML_FF_MIC_INPUT (client advertises in x-ml-general.featureFlags): 0x04
+  //   Set by a patched Moonlight Qt client to tell Apollo "I will send mic audio."
+  //   Parsed into session_t::mic.client_advertised during session::alloc().
+  static constexpr std::uint32_t SS_FF_MIC_INPUT = 0x0100;
+  static constexpr std::uint32_t ML_FF_MIC_INPUT = 0x04;
+
+  // Verify the platform_caps value matches the canonical constant.
+  static_assert(platf::platform_caps::mic_input == SS_FF_MIC_INPUT,
+    "platform_caps::mic_input must equal SS_FF_MIC_INPUT");
+
   struct mic_frame_header_t {
     boost::endian::big_uint16_at sequenceNumber;   // BE16; monotonic, wraps at 65535
     boost::endian::big_uint16_at opusFrameLength;  // BE16; byte length of the Opus payload following this struct
@@ -799,10 +818,19 @@ namespace stream {
     } control;
 
     struct {
+      // H3: set true in session::alloc() when the client's SDP advertised
+      // ML_FF_MIC_INPUT. All mic-path operations (decode, render) are gated on
+      // this flag. When false, the 0x5510 dispatch handler returns immediately
+      // without allocating any resources and logs one debug message (guarded by
+      // warn_once_no_capability to avoid per-packet log spam from stock clients).
+      bool client_advertised = false;
+      bool warn_once_no_capability = false;
+
       // Per-session Opus decoder for the client-to-host microphone stream
       // (moonlight-mic extension SS_MIC_OPUS_PTYPE = 0x5510). Allocated in
-      // session::alloc(), released by the safe_ptr destructor when the session
-      // is freed. Fixed at 48 kHz / mono / 20 ms frames matching the wire spec.
+      // session::alloc() only when client_advertised is true, released by the
+      // safe_ptr destructor when the session is freed. Fixed at 48 kHz / mono /
+      // 20 ms frames matching the wire spec.
       opus_decoder_t decoder;
       std::uint16_t lastSeq;
       bool seenFirstFrame;
@@ -1463,6 +1491,19 @@ namespace stream {
       // Wire format: 8-byte big-endian SS_MIC_FRAME_HEADER followed by
       // opusFrameLength bytes of Opus payload (mono / 48 kHz / 20 ms).
       // See docs/design/WIRE.md and moonlight-common-c/src/Mic.h.
+
+      // H3: gate on capability negotiation. A stock Moonlight client never sends
+      // 0x5510 (it checks SS_FF_MIC_INPUT before calling LiSendMicAudioFrame),
+      // but if a 0x5510 packet somehow arrives for a session where the client
+      // did not advertise ML_FF_MIC_INPUT, drop it silently with one debug log.
+      if (!session->mic.client_advertised) {
+        if (!session->mic.warn_once_no_capability) {
+          session->mic.warn_once_no_capability = true;
+          BOOST_LOG(debug) << "Mic packet ignored: client did not advertise ML_FF_MIC_INPUT"sv;
+        }
+        return;
+      }
+
       constexpr std::size_t MIC_PACKET_MTU = 1400;  // matches MAX_PACKET_SIZE in moonlight-common-c
       constexpr int MIC_SAMPLE_RATE = 48000;
       constexpr int MIC_FRAME_DURATION_MS = 20;
@@ -2790,11 +2831,23 @@ namespace stream {
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
 
-      // Allocate the per-session Opus decoder for the client-to-host mic stream.
-      // Fixed at 48 kHz / mono per the wire spec (docs/design/WIRE.md).
-      // If creation fails, log and leave the decoder null — the dispatch handler
-      // will tolerate a null decoder by dropping mic packets with a warning.
-      {
+      // H3: parse client capability. ML_FF_MIC_INPUT in x-ml-general.featureFlags
+      // (already stored in config.mlFeatureFlags by the RTSP SETUP handler) tells us
+      // whether this client supports mic passthrough. All mic resources are gated on
+      // this flag — stock-client sessions allocate nothing and zero WASAPI activity.
+      //
+      // Allocation strategy: eager allocation gated on the flag (option b from brief).
+      // config.mlFeatureFlags is populated by cmd_setup() before session::alloc() is
+      // called, so the flag value is always available here. This is simpler than lazy
+      // allocation and avoids the decoder being accessed from multiple code paths.
+      session->mic.client_advertised = (config.mlFeatureFlags & ML_FF_MIC_INPUT) != 0;
+      session->mic.warn_once_no_capability = false;
+
+      if (session->mic.client_advertised) {
+        // Allocate the per-session Opus decoder for the client-to-host mic stream.
+        // Fixed at 48 kHz / mono per the wire spec (docs/design/WIRE.md).
+        // If creation fails, log and leave the decoder null — the dispatch handler
+        // will tolerate a null decoder by dropping mic packets with a warning.
         int opus_err = 0;
         OpusDecoder *raw_decoder = opus_decoder_create(48000, 1, &opus_err);
         if (raw_decoder == nullptr || opus_err != OPUS_OK) {
