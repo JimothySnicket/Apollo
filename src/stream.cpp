@@ -825,6 +825,11 @@ namespace stream {
       // warn_once_no_capability to avoid per-packet log spam from stock clients).
       bool client_advertised = false;
       bool warn_once_no_capability = false;
+      // H4: fired once per session if a 0x5510 packet arrives on a non-Windows
+      // host. In practice this should never happen — the host doesn't advertise
+      // SS_FF_MIC_INPUT on Linux/macOS so a compliant client never sends. The
+      // flag is defensive: non-compliant or buggy clients get one log line.
+      bool warn_once_no_platform = false;
 
       // Per-session Opus decoder for the client-to-host microphone stream
       // (moonlight-mic extension SS_MIC_OPUS_PTYPE = 0x5510). Allocated in
@@ -1660,8 +1665,19 @@ namespace stream {
         }
       }
 #else
-      // Non-Windows: decode-and-discard (H1 fallback). H4 will add stubs.
-      (void) pcmBuffer;
+      {
+        // H4: non-Windows platform stub. Linux/macOS host audio routing is not
+        // yet implemented (no PipeWire/PulseAudio/CoreAudio path). Log once per
+        // session so that non-compliant or buggy clients get a clear diagnostic.
+        // A compliant client should never reach this branch because the host does
+        // not advertise SS_FF_MIC_INPUT on Linux/macOS (see get_capabilities() in
+        // src/platform/linux/input.cpp and src/platform/macos/input.cpp).
+        if (!session->mic.warn_once_no_platform) {
+          session->mic.warn_once_no_platform = true;
+          BOOST_LOG(warning) << "Mic packet received but host platform has no mic-input support yet (Linux/macOS support TBD)"sv;
+        }
+        (void) pcmBuffer;
+      }
 #endif
     });
 
@@ -2842,6 +2858,7 @@ namespace stream {
       // allocation and avoids the decoder being accessed from multiple code paths.
       session->mic.client_advertised = (config.mlFeatureFlags & ML_FF_MIC_INPUT) != 0;
       session->mic.warn_once_no_capability = false;
+      session->mic.warn_once_no_platform = false;
 
       if (session->mic.client_advertised) {
         // Allocate the per-session Opus decoder for the client-to-host mic stream.
