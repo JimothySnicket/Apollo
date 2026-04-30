@@ -1,0 +1,53 @@
+---
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+      - moonlight-mic
+    types:
+      - opened
+      - synchronize
+      - reopened
+  push:
+    branches:
+      - master
+      - moonlight-mic
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          chmod +x ./scripts/linux_build.sh
+          ./scripts/linux_build.sh \
+            --step=deps \
+            --skip-cuda \
+            --skip-package
+
+      - name: Build
+        run: |
+          ./scripts/linux_build.sh \
+            --step=cmake \
+            --skip-cuda \
+            --skip-package \
+            --publisher-name='JimothySnicket' \
+            --publisher-website='https://github.com/JimothySnicket/Apollo' \
+            --publisher-issue-url='https://github.com/JimothySnicket/Apollo/issues'
+          ./scripts/linux_build.sh \
+            --step=build \
+            --skip-cuda \
+            --skip-package
