@@ -42,6 +42,7 @@ jobs:
         run: |
           ./scripts/linux_build.sh \
             --step=cmake \
+            --build-tests \
             --skip-cuda \
             --skip-package \
             --publisher-name='JimothySnicket' \
@@ -51,3 +52,7 @@ jobs:
             --step=build \
             --skip-cuda \
             --skip-package
+
+      - name: Test
+        run: |
+          cd build && ctest --output-on-failure
