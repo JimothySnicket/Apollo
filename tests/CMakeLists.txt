@@ -115,3 +115,7 @@ if (WIN32)
     # this fixes libcurl linking errors when using non MSYS2 version of CMake
     set_target_properties(${PROJECT_NAME} PROPERTIES LINK_SEARCH_START_STATIC 1)
 endif ()
+
+# Register GoogleTest cases with CTest so `ctest --output-on-failure` works.
+include(GoogleTest)
+gtest_discover_tests(${PROJECT_NAME})
