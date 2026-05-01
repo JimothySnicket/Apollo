@@ -15,6 +15,7 @@ num_processors=$(nproc)
 publisher_name="Third Party Publisher"
 publisher_website=""
 publisher_issue_url="https://app.lizardbyte.dev/support"
+build_tests=0
 skip_cleanup=0
 skip_cuda=0
 skip_libva=0
@@ -138,6 +139,7 @@ while getopts ":hs-:" opt; do
         publisher-issue-url=*)
           publisher_issue_url="${OPTARG#*=}"
           ;;
+        build-tests) build_tests=1 ;;
         skip-cleanup) skip_cleanup=1 ;;
         skip-cuda) skip_cuda=1 ;;
         skip-libva) skip_libva=1 ;;
@@ -567,6 +569,11 @@ function run_step_cmake() {
     if [ "${SUNSHINE_COMPILE_DOXYGEN}" != "true" ]; then
       cmake_args+=("-DBUILD_DOCS=OFF")
     fi
+  fi
+
+  # Handle tests
+  if [ "$build_tests" == 1 ]; then
+    cmake_args+=("-DBUILD_TESTS=ON")
   fi
 
   # Handle CUDA

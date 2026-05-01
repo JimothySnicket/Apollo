@@ -49,6 +49,7 @@ extern "C" {
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
+#include "mic_parser.h"
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
@@ -292,17 +293,6 @@ namespace stream {
   // Verify the platform_caps value matches the canonical constant.
   static_assert(platf::platform_caps::mic_input == SS_FF_MIC_INPUT,
     "platform_caps::mic_input must equal SS_FF_MIC_INPUT");
-
-  struct mic_frame_header_t {
-    boost::endian::big_uint16_at sequenceNumber;   // BE16; monotonic, wraps at 65535
-    boost::endian::big_uint16_at opusFrameLength;  // BE16; byte length of the Opus payload following this struct
-    boost::endian::big_uint32_at timestampSamples; // BE32; 48 kHz sample count since first frame this session
-  };
-
-  static_assert(
-    sizeof(mic_frame_header_t) == 8,
-    "mic_frame_header_t must be 8 bytes"
-  );
 
 #pragma pack(pop)
 
@@ -1509,33 +1499,53 @@ namespace stream {
         return;
       }
 
-      constexpr std::size_t MIC_PACKET_MTU = 1400;  // matches MAX_PACKET_SIZE in moonlight-common-c
       constexpr int MIC_SAMPLE_RATE = 48000;
       constexpr int MIC_FRAME_DURATION_MS = 20;
       constexpr int MIC_SAMPLES_PER_FRAME = MIC_SAMPLE_RATE * MIC_FRAME_DURATION_MS / 1000;  // 960
 
-      // --- Validation ---
+      // --- Validation via pure parser ---
 
-      if (payload.size() < sizeof(mic_frame_header_t)) {
-        BOOST_LOG(warning) << "Mic packet runt: "sv << payload.size()
-                           << " bytes (need >= "sv << sizeof(mic_frame_header_t) << ')';
+      auto rawSpan = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(payload.data()), payload.size());
+      auto parseResult = mic::parse_mic_frame(rawSpan);
+
+      if (std::holds_alternative<mic::parse_error_t>(parseResult)) {
+        auto err = std::get<mic::parse_error_t>(parseResult);
+        switch (err) {
+          case mic::parse_error_t::payload_too_small:
+            BOOST_LOG(warning) << "Mic packet runt: "sv << payload.size()
+                               << " bytes (need >= "sv << sizeof(mic::frame_header_t) << ')';
+            break;
+          case mic::parse_error_t::opus_length_zero:
+          case mic::parse_error_t::opus_length_too_large:
+            // Reconstruct opusLen from the raw header for the log message,
+            // mirroring the original behaviour exactly.
+            if (payload.size() >= sizeof(mic::frame_header_t)) {
+              const auto *hdr = reinterpret_cast<const mic::frame_header_t *>(payload.data());
+              BOOST_LOG(warning) << "Mic packet bad opusFrameLength: "sv
+                                 << static_cast<uint16_t>(hdr->opusFrameLength);
+            } else {
+              BOOST_LOG(warning) << "Mic packet bad opusFrameLength (runt)"sv;
+            }
+            break;
+          case mic::parse_error_t::inner_length_mismatch:
+            if (payload.size() >= sizeof(mic::frame_header_t)) {
+              const auto *hdr = reinterpret_cast<const mic::frame_header_t *>(payload.data());
+              BOOST_LOG(warning) << "Mic packet length mismatch: header opusFrameLength="sv
+                                 << static_cast<uint16_t>(hdr->opusFrameLength)
+                                 << " payload.size()="sv << payload.size();
+            } else {
+              BOOST_LOG(warning) << "Mic packet length mismatch (runt)"sv;
+            }
+            break;
+        }
         return;
       }
 
-      auto header = reinterpret_cast<const mic_frame_header_t *>(payload.data());
-      const uint16_t seq = header->sequenceNumber;
-      const uint16_t opusLen = header->opusFrameLength;
-      const uint32_t tsSamples = header->timestampSamples;
-
-      if (opusLen < 1 || opusLen > MIC_PACKET_MTU - sizeof(mic_frame_header_t)) {
-        BOOST_LOG(warning) << "Mic packet bad opusFrameLength: "sv << opusLen;
-        return;
-      }
-      if (sizeof(mic_frame_header_t) + opusLen != payload.size()) {
-        BOOST_LOG(warning) << "Mic packet length mismatch: header opusFrameLength="sv << opusLen
-                           << " payload.size()="sv << payload.size();
-        return;
-      }
+      auto &frame = std::get<mic::parsed_frame_t>(parseResult);
+      const uint16_t seq      = frame.sequenceNumber;
+      const uint16_t opusLen  = frame.opusFrameLength;
+      const uint32_t tsSamples = frame.timestampSamples;
 
       if (!session->mic.decoder) {
         BOOST_LOG(warning) << "Mic packet dropped: decoder unavailable"sv;
@@ -1544,7 +1554,7 @@ namespace stream {
 
       // --- Decode ---
 
-      const auto *opusBytes = reinterpret_cast<const unsigned char *>(payload.data()) + sizeof(mic_frame_header_t);
+      const auto *opusBytes = reinterpret_cast<const unsigned char *>(frame.opusPayload.data());
       opus_int16 pcmBuffer[MIC_SAMPLES_PER_FRAME];
 
       // Feed opus_decode the wire-spec frame size (not the packet header value
