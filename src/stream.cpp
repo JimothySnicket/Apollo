@@ -8,6 +8,14 @@
 #include <future>
 #include <queue>
 
+#ifdef DEBUG_MIC_AB_CAPTURE
+// moonlight-mic A1: includes only pulled in when debug capture is enabled.
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <string>
+#endif
+
 // lib includes
 #include <boost/endian/arithmetic.hpp>
 #include <openssl/err.h>
@@ -644,6 +652,121 @@ namespace stream {
   }
 #endif  // _WIN32
 
+#ifdef DEBUG_MIC_AB_CAPTURE
+  // ---------------------------------------------------------------------------
+  // moonlight-mic debug A/B capture (host side)
+  //
+  // Compiled in only when the cmake option DEBUG_MIC_AB_CAPTURE=ON is set.
+  // When OFF (the default for any production / upstream-eligible build), the
+  // entire feature — including all per-session struct fields, polling code,
+  // and the opus_decode tap — is removed by the preprocessor. The host-side
+  // mic dispatch handler is byte-identical to the non-debug build.
+  //
+  // Workflow:
+  //   1. Operator sets the env var APOLLO_MIC_AB_CAPTURE_DIR before launching
+  //      Apollo (e.g. C:\debug\moonlight-mic-ab\).
+  //   2. To trigger a capture, operator creates an empty file named .arm in
+  //      that directory.
+  //   3. The dispatch handler polls for the file once per second worth of
+  //      arrived frames (50 frames = 1 s). On detection it deletes the file
+  //      and starts capturing kDebugCaptureSeconds of post-decode mic samples
+  //      to host-post-decode-YYYYMMDD-HHMMSS.wav.
+  //   4. When the capture is complete the WAV is finalised and the next .arm
+  //      can re-trigger.
+  //
+  // The capture state is per-session so concurrent client sessions each get
+  // their own file.
+  //
+  // Audio voice samples are written ONLY to the WAV (never logged or
+  // serialised elsewhere) per the wire-format spec section 9.4.
+  //
+  // See docs/development/mic-ab-capture.md (in the moonlight-mic umbrella
+  // repo) for the full workflow doc.
+
+  constexpr int kDebugMicCaptureSeconds = 10;
+  constexpr int kDebugMicCapturePollEveryNFrames = 50;  // 50 * 20 ms = 1 s
+
+  // Resolve the host-side capture output dir from the env var. Empty string
+  // means the feature is dormant for this Apollo invocation.
+  static std::string debug_mic_capture_dir() {
+    const char *env = std::getenv("APOLLO_MIC_AB_CAPTURE_DIR");
+    if (env == nullptr || env[0] == '\0') {
+      return std::string();
+    }
+    return std::string(env);
+  }
+
+  // Build a timestamped WAV filename: host-post-decode-YYYYMMDD-HHMMSS.wav.
+  static std::string debug_mic_capture_path(const std::string &dir) {
+    std::time_t now = std::time(nullptr);
+    std::tm tm_buf;
+  #ifdef _WIN32
+    localtime_s(&tm_buf, &now);
+  #else
+    localtime_r(&now, &tm_buf);
+  #endif
+    char stamp[32];
+    std::snprintf(stamp, sizeof(stamp),
+                  "%04d%02d%02d-%02d%02d%02d",
+                  tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                  tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    std::string path = dir;
+    if (!path.empty() && path.back() != '/' && path.back() != '\\') {
+      path.push_back('/');
+    }
+    path += "host-post-decode-";
+    path += stamp;
+    path += ".wav";
+    return path;
+  }
+
+  // Write a 44-byte PCM WAV header for 48 kHz mono signed-16-bit at the
+  // current file position (used both for the provisional header and for the
+  // final rewrite once the sample count is known). Numbers are LE per WAV
+  // convention.
+  static void debug_mic_write_wav_header(std::FILE *f, std::uint32_t sample_count) {
+    auto write_u32_le = [&](std::uint32_t v) {
+      unsigned char b[4] = {
+        static_cast<unsigned char>(v & 0xff),
+        static_cast<unsigned char>((v >> 8) & 0xff),
+        static_cast<unsigned char>((v >> 16) & 0xff),
+        static_cast<unsigned char>((v >> 24) & 0xff),
+      };
+      std::fwrite(b, 1, 4, f);
+    };
+    auto write_u16_le = [&](std::uint16_t v) {
+      unsigned char b[2] = {
+        static_cast<unsigned char>(v & 0xff),
+        static_cast<unsigned char>((v >> 8) & 0xff),
+      };
+      std::fwrite(b, 1, 2, f);
+    };
+
+    constexpr std::uint16_t channels = 1;
+    constexpr std::uint32_t sample_rate = 48000;
+    constexpr std::uint16_t bits_per_sample = 16;
+    constexpr std::uint32_t bytes_per_sample = (channels * bits_per_sample) / 8;  // 2
+    const std::uint32_t data_chunk_bytes = sample_count * bytes_per_sample;
+    const std::uint32_t riff_chunk_bytes = 36 + data_chunk_bytes;
+
+    std::fwrite("RIFF", 1, 4, f);
+    write_u32_le(riff_chunk_bytes);
+    std::fwrite("WAVE", 1, 4, f);
+
+    std::fwrite("fmt ", 1, 4, f);
+    write_u32_le(16);
+    write_u16_le(1);                                       // PCM format
+    write_u16_le(channels);
+    write_u32_le(sample_rate);
+    write_u32_le(sample_rate * bytes_per_sample);          // byte rate
+    write_u16_le(static_cast<std::uint16_t>(bytes_per_sample));
+    write_u16_le(bits_per_sample);
+
+    std::fwrite("data", 1, 4, f);
+    write_u32_le(data_chunk_bytes);
+  }
+#endif  // DEBUG_MIC_AB_CAPTURE
+
   using av_session_id_t = std::variant<asio::ip::address, std::string>;  // IP address or SS-Ping-Payload from RTSP handshake
   using message_queue_t = std::shared_ptr<safe::queue_t<std::pair<udp::endpoint, std::string>>>;
   using message_queue_queue_t = std::shared_ptr<safe::queue_t<std::tuple<socket_e, av_session_id_t, message_queue_t>>>;
@@ -837,6 +960,17 @@ namespace stream {
       // decode-and-discard with no crash.
       std::unique_ptr<mic_endpoint_t> endpoint;
       bool endpoint_init_attempted = false;
+#endif
+
+#ifdef DEBUG_MIC_AB_CAPTURE
+      // moonlight-mic A1: per-session post-decode WAV capture state.
+      // Compiled out unless DEBUG_MIC_AB_CAPTURE is set at cmake time.
+      // capture_file is non-null while a capture is in progress.
+      std::FILE *capture_file = nullptr;
+      std::uint32_t capture_samples_written = 0;
+      // Frames-since-last-poll counter; we only stat() the .arm file once
+      // per ~1 second of frames to avoid hammering the filesystem.
+      int capture_poll_counter = 0;
 #endif
     } mic;
 
@@ -1569,6 +1703,77 @@ namespace stream {
         BOOST_LOG(warning) << "Mic decode failed: "sv << opus_strerror(decodedSamples);
         return;
       }
+
+#ifdef DEBUG_MIC_AB_CAPTURE
+      // moonlight-mic A1: post-decode capture tap. The capture is taken HERE,
+      // immediately after opus_decode() and BEFORE the WASAPI write path that
+      // could distort the samples (mono->stereo expansion, s16->f32 conversion,
+      // sample-rate adjustments). This guarantees the captured WAV reflects
+      // exactly what came out of the Opus decoder, which is the meaningful
+      // comparison point against the client's pre-encode WAV.
+      //
+      // Compiled out entirely when DEBUG_MIC_AB_CAPTURE is undefined; the
+      // production audio path has zero overhead from this block.
+      {
+        // Only consider polling/capturing if APOLLO_MIC_AB_CAPTURE_DIR is set.
+        // Cache the directory string in a function-local static — env var is
+        // read once per process, not once per packet.
+        static const std::string s_capture_dir = debug_mic_capture_dir();
+        if (!s_capture_dir.empty()) {
+          // Poll for the .arm trigger file once per ~1 second of frames
+          // (50 frames * 20 ms each). This is the rearm signal — Apollo
+          // captures kDebugMicCaptureSeconds of post-decode PCM whenever it
+          // sees the file, then deletes it.
+          if (session->mic.capture_file == nullptr) {
+            if (++session->mic.capture_poll_counter >= kDebugMicCapturePollEveryNFrames) {
+              session->mic.capture_poll_counter = 0;
+              std::string arm_path = s_capture_dir;
+              if (!arm_path.empty() && arm_path.back() != '/' && arm_path.back() != '\\') {
+                arm_path.push_back('/');
+              }
+              arm_path += ".arm";
+              if (std::FILE *probe = std::fopen(arm_path.c_str(), "rb")) {
+                std::fclose(probe);
+                std::remove(arm_path.c_str());
+                std::string wav_path = debug_mic_capture_path(s_capture_dir);
+                std::FILE *wav = std::fopen(wav_path.c_str(), "wb");
+                if (wav == nullptr) {
+                  BOOST_LOG(warning) << "Mic A/B capture: fopen('"sv << wav_path
+                                     << "') failed; ignoring trigger"sv;
+                } else {
+                  // Provisional header rewritten on close.
+                  debug_mic_write_wav_header(wav, 0);
+                  session->mic.capture_file = wav;
+                  session->mic.capture_samples_written = 0;
+                  BOOST_LOG(info) << "Mic A/B capture STARTED -> "sv << wav_path;
+                }
+              }
+            }
+          }
+
+          // If a capture is in progress, write this frame's decoded samples.
+          if (session->mic.capture_file != nullptr && decodedSamples > 0) {
+            const std::size_t bytes = static_cast<std::size_t>(decodedSamples) * sizeof(opus_int16);
+            std::fwrite(pcmBuffer, 1, bytes, session->mic.capture_file);
+            session->mic.capture_samples_written += static_cast<std::uint32_t>(decodedSamples);
+
+            const std::uint32_t target_samples =
+              static_cast<std::uint32_t>(kDebugMicCaptureSeconds) * 48000u;
+            if (session->mic.capture_samples_written >= target_samples) {
+              std::fseek(session->mic.capture_file, 0, SEEK_SET);
+              debug_mic_write_wav_header(session->mic.capture_file,
+                                         session->mic.capture_samples_written);
+              std::fclose(session->mic.capture_file);
+              session->mic.capture_file = nullptr;
+              BOOST_LOG(info) << "Mic A/B capture COMPLETE ("sv
+                              << session->mic.capture_samples_written
+                              << " samples = "sv << kDebugMicCaptureSeconds << " s)"sv;
+              session->mic.capture_samples_written = 0;
+            }
+          }
+        }
+      }
+#endif
 
       BOOST_LOG(debug) << "Mic frame decoded: seq="sv << seq
                        << " opusLen="sv << opusLen
@@ -2721,6 +2926,21 @@ namespace stream {
 
         platf::streaming_will_stop();
       }
+
+#ifdef DEBUG_MIC_AB_CAPTURE
+      // moonlight-mic A1: finalise any in-progress mic capture for this
+      // session. Compiled out unless DEBUG_MIC_AB_CAPTURE=ON.
+      if (session.mic.capture_file != nullptr) {
+        std::fseek(session.mic.capture_file, 0, SEEK_SET);
+        debug_mic_write_wav_header(session.mic.capture_file,
+                                   session.mic.capture_samples_written);
+        std::fclose(session.mic.capture_file);
+        session.mic.capture_file = nullptr;
+        BOOST_LOG(info) << "Mic A/B capture finalised on session end (partial: "sv
+                        << session.mic.capture_samples_written << " samples)"sv;
+        session.mic.capture_samples_written = 0;
+      }
+#endif
 
       BOOST_LOG(debug) << "Session ended"sv;
     }
