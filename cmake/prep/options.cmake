@@ -11,6 +11,12 @@ option(BUILD_DOCS "Build documentation" OFF)
 option(BUILD_TESTS "Build tests" OFF)
 option(NPM_OFFLINE "Use offline npm packages. You must ensure packages are in your npm cache." OFF)
 
+# moonlight-mic A1: enable host-side mic A/B capture instrumentation.
+# When OFF (the default), the entire feature is removed by the preprocessor —
+# no extra fields on session_t::mic, no polling, no opus_decode tap. See
+# docs/development/mic-ab-capture.md (in the moonlight-mic umbrella repo).
+option(DEBUG_MIC_AB_CAPTURE "Enable moonlight-mic post-decode A/B capture (debug only)" OFF)
+
 option(BUILD_WERROR "Enable -Werror flag." OFF)
 
 # if this option is set, the build will exit after configuring special package configuration files
