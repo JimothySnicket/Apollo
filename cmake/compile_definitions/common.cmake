@@ -121,6 +121,14 @@ if(NOT SUNSHINE_ASSETS_DIR_DEF)
 endif()
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_ASSETS_DIR="${SUNSHINE_ASSETS_DIR_DEF}")
 
+# moonlight-mic A1: pass DEBUG_MIC_AB_CAPTURE through to the C++ compiler when
+# the cmake option is enabled. When OFF (the default), the macro is undefined
+# and all related code in stream.cpp is removed by the preprocessor.
+if(DEBUG_MIC_AB_CAPTURE)
+    message(STATUS "moonlight-mic: DEBUG_MIC_AB_CAPTURE enabled")
+    list(APPEND SUNSHINE_DEFINITIONS DEBUG_MIC_AB_CAPTURE)
+endif()
+
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_TRAY=${SUNSHINE_TRAY})
 
 # Publisher metadata
