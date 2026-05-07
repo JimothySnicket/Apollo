@@ -325,11 +325,16 @@ namespace video {
     avcodec_encode_session_t(avcodec_encode_session_t &&other) noexcept = default;
 
     ~avcodec_encode_session_t() {
-      // Flush any remaining frames in the encoder
+#ifndef _WIN32
+      // Flush any remaining frames in the encoder.
+      // Skipped on Windows: upstream 02036920 added this drain; AMF in Session 0
+      // deadlocks on avcodec_receive_packet (no GPU completion event without an
+      // interactive desktop). v0.4.6 had no drain and worked fine on Windows.
       if (avcodec_send_frame(avcodec_ctx.get(), nullptr) == 0) {
         packet_raw_avcodec pkt;
         while (avcodec_receive_packet(avcodec_ctx.get(), pkt.av_packet) == 0);
       }
+#endif
 
       // Order matters here because the context relies on the hwdevice still being valid
       avcodec_ctx.reset();
