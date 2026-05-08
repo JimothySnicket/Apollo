@@ -1,3 +1,9 @@
+> **Branch: `moonlight-mic-v046` — microphone passthrough for Sunshine + Moonlight.**
+>
+> Part of the [moonlight-mic](https://github.com/JimothySnicket/moonlight-mic) project: a coordinated change across `moonlight-common-c`, `moonlight-qt`, and `Apollo` that adds client-to-host microphone passthrough. See the umbrella for setup, design, and combined releases.
+
+---
+
 # Apollo
 
 Apollo is a self-hosted desktop stream host for [Artemis(Moonlight Noir)](https://github.com/ClassicOldSong/moonlight-android). Offering low latency, native client resolution, cloud gaming server capabilities with support for AMD, Intel, and Nvidia GPUs for hardware encoding. Software encoding is also available. A web UI is provided to allow configuration and client pairing from your favorite web browser. Pair from the local server or any mobile device.
